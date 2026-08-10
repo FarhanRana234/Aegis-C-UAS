@@ -1,4 +1,4 @@
-# Aegis C-UAS HPM (Counter-Unmanned Aerial Systems - High Power Microwave)
+# Aegis C-UAS (Counter-Unmanned Aerial Systems)
 
 A robust, dual-sensor Ground Control Station (GCS) and computer vision tracking pipeline designed for Counter-UAS applications. Aegis integrates asynchronous **Thermal IR** and **Optical RGB** video feeds, equipped with advanced target tracking, swarm macro-clustering, and environmental clutter filtering.
 
