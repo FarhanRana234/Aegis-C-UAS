@@ -190,11 +190,11 @@ python main.py
 ## 🗂️ Project Directory Structure
 
 ```text
-aegis-cuas-hpm/
+aegis-cuas/
 │
 ├── models/
 │   ├── thermal_best.pt      # Custom trained thermal weights
-│   └── yolo11n.pt           # Base/fine-tuned optical weights
+│   └── rgb_best.pt           # Base/fine-tuned optical weights
 │
 ├── IR_videos/
 │   └── ir_test.mp4          # Sample IR test stream
@@ -203,8 +203,6 @@ aegis-cuas-hpm/
 │   └── rgb_test1.mp4        # Sample RGB test stream
 │
 ├── main.py                  # Core GCS control & tracking loop
-├── merge_datasets.py        # Dataset combination utility script
-├── requirements.txt         # Project dependencies
 └── README.md                # Project documentation
 
 ```
