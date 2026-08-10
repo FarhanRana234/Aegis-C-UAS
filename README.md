@@ -203,6 +203,7 @@ aegis-cuas/
 │   └── rgb_test1.mp4        # Sample RGB test stream
 │
 ├── main.py                  # Core GCS control & tracking loop
+├── requirements.txt
 └── README.md                # Project documentation
 
 ```
