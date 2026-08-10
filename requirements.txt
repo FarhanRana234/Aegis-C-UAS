@@ -1,0 +1,11 @@
+# Aegis C-UAS - Core dependencies
+ultralytics>=8.3.0
+opencv-python>=4.8.0
+numpy>=1.23.0,<2.1.0
+scikit-learn>=1.3.0
+roboflow>=1.1.0
+
+# Note:
+# - ultralytics pulls in torch, torchvision, etc. automatically
+# - For GPU: install CUDA-enabled torch first if needed
+# - numpy upper bound avoids rare compatibility issues with some ultralytics builds
