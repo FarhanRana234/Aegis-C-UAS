@@ -1,36 +1,69 @@
-# Aegis C-UAS HPM (Counter-Unmanned Aerial Systems - High Power Microwave)
 
-A robust, dual-sensor Ground Control Station (GCS) and computer vision tracking pipeline designed for Counter-UAS applications. Aegis integrates asynchronous **Thermal IR** and **Optical RGB** video feeds, equipped with advanced target tracking, swarm macro-clustering, and environmental clutter filtering.
+# Aegis C-UAS (Counter-Unmanned Aerial Systems)
+
+A dual-sensor Ground Control Station (GCS) and computer vision tracking pipeline for Counter-UAS applications.  
+Aegis processes asynchronous **Thermal IR** and **Optical RGB** video feeds with advanced target tracking, swarm macro-clustering, stationary clutter rejection, and ByteTrack persistence.
+
+> **Note:** This is a bench prototype focused on dual-sensor tracking and swarm prioritisation for a conceptual wide-area but targeted High-Power Microwave (HPM) effector. It is not a fielded system.
 
 ---
 
 ## 🚀 Key Features
 
-* **Dual-Sensor Fusion & Independent Asynchronous Pipeline:** Handles mismatched frame rates (e.g., high-FPS IR streams and standard optical RGB feeds) concurrently without stuttering or locking the main UI thread.
-* **Stationary Thermal Clutter Suppression:** Filters out background false positives caused by *thermal inertia* (e.g., sun-baked rocks, asphalt, or rooftops that retain heat at night) by analyzing pixel displacement across frames.
-* **Swarm Macro-Clustering (DBSCAN):** Utilizes Density-Based Spatial Clustering to group dense swarms of drones into a unified macro-bounding box while maintaining individual tracking coordinates.
-* **Sticky Single-Target Tracking:** Implements spatial nearest-neighbor matching rather than volatile confidence scoring to prevent target-switching jitter when multiple unclustered drones are present.
-* **Coasting Grace Period:** Maintains a target lock for a configurable grace period (up to 15 frames) if temporary occlusion or detection dropouts occur.
+* **Dual-Sensor Asynchronous Pipeline**  
+  Independent handling of Thermal IR and Optical RGB streams that may have mismatched frame rates. Prevents one sensor from blocking the other and keeps the UI responsive.
+
+* **Stationary Thermal Clutter Suppression**  
+  Background objects (sun-baked rocks, rooftops, asphalt, etc.) that retain heat frequently produce false positives that look like drones.  
+  The system measures pixel displacement of candidate boxes. If a detection moves **less than 2 pixels across approximately 10 consecutive frames**, it is treated as static clutter and ignored.  
+  This was added because the IR stream was repeatedly switching between multiple stationary heat signatures.
+
+* **ByteTrack Persistence + Coasting**  
+  YOLO11 detections are passed through ByteTrack for temporal consistency so the bounding box does not glitch on brief detection dropouts.  
+  When a track is temporarily lost (occlusion or low confidence), the last known box is held for up to **15 frames** (coasting).  
+  Observed coast success rate on the test sequences is approximately **80%** (visible in the LinkedIn demo video).
+
+* **Swarm Macro-Clustering (DBSCAN)**  
+  Dense groups of drones are clustered into a single macro bounding box while individual track coordinates are retained.  
+  Distant or isolated drones outside the main cluster are de-prioritised when a dense swarm is present.  
+  This matches the operational concept of a wide-area but targeted HPM effector — focusing energy on the densest threat group increases hit probability instead of spreading power across scattered single drones.
+
+* **Sticky Single-Target Tracking**  
+  When multiple unclustered detections exist, the system prefers spatial nearest-neighbour continuity over raw confidence scores. This prevents the classic “box jumping” / target-switching jitter.
+
+---
+
+## 📊 Design Decisions & Observed Performance
+
+| Component                      | Rationale / Observation                                                                 | Result / Metric                          |
+|--------------------------------|-----------------------------------------------------------------------------------------|------------------------------------------|
+| IR Clutter Filter              | IR stream kept locking onto static heat sources that resembled drones                   | < 2 px movement over ~10 frames → ignore |
+| ByteTrack + Coasting           | Reduce glitching and brief detection dropouts                                           | Coast success ≈ 80% on test clips        |
+| Macro-Clustering (DBSCAN)      | HPM is wide-area but energy should be concentrated                                      | Prioritises dense swarm over distant singles |
+| Dual asynchronous pipelines    | IR and RGB rarely share the same native FPS                                             | Independent advance without stutter      |
+
+These figures come from the bench prototype test sequences shown in the LinkedIn demo. They are observed results rather than formal benchmark numbers.
 
 ---
 
 ## 🔗 Roboflow Dataset Sources
 
-The custom models were trained on multi-source datasets curated via Roboflow and exported in **YOLOv11** format. You can access the public datasets here:
+The custom models were trained on multi-source datasets curated via Roboflow and exported in **YOLOv11** format.
 
-* **Thermal Dataset 1:** [Maor Ovadia - Thermal Drone (v11)](https://www.google.com/search?q=https://universe.roboflow.com/maor-ovadia/thermal-drone-47qfh/dataset/11)
-* **Thermal Dataset 2:** [Nguyn Quyt - Thermal Drone (v2)](https://www.google.com/search?q=https://universe.roboflow.com/nguyn-quyt/thermal-drone/dataset/2)
-* **Optical Dataset 1:** [UAV Swarm Augmentation (v1)](https://www.google.com/search?q=https://universe.roboflow.com/project-8cfvz/uavswarmv_augmentation/dataset/1)
-* **Optical Dataset 2:** [Drone Detection (v1)](https://www.google.com/search?q=https://universe.roboflow.com/project-986i8/drone-uskpc/dataset/1)
+* **Thermal Dataset 1:** [Maor Ovadia – Thermal Drone (v11)](https://universe.roboflow.com/maor-ovadia/thermal-drone-47qfh/dataset/11)
+* **Thermal Dataset 2:** [Nguyn Quyt – Thermal Drone (v2)](https://universe.roboflow.com/nguyn-quyt/thermal-drone/dataset/2)
+* **Optical Dataset 1:** [UAV Swarm Augmentation (v1)](https://universe.roboflow.com/project-8cfvz/uavswarmv_augmentation/dataset/1)
+* **Optical Dataset 2:** [Drone Detection (v1)](https://universe.roboflow.com/project-986i8/drone-uskpc/dataset/1)
 
-### Downloading via Python Snippets
+### Downloading via Python
 
 ```python
 !pip install roboflow
 from roboflow import Roboflow
 
-# Thermal Dataset 1
 rf = Roboflow(api_key="API_key_here")
+
+# Thermal Dataset 1
 project = rf.workspace("maor-ovadia").project("thermal-drone-47qfh")
 dataset_thermal_1 = project.version(11).download("yolov11")
 
@@ -45,14 +78,13 @@ dataset_rgb_1 = project.version(1).download("yolov11")
 # Optical Dataset 2
 project = rf.workspace("project-986i8").project("drone-uskpc")
 dataset_rgb_2 = project.version(1).download("yolov11")
-
 ```
 
 ---
 
 ## 🛠️ Dataset Merge Script (`merge_datasets.py`)
 
-When downloading multiple datasets from Roboflow in YOLO format, file names often overlap (e.g., `image_001.jpg` across folders). Use this script to merge them into a single unified directory with automatic prefixing:
+When multiple YOLO-format datasets are downloaded from Roboflow, filenames often collide (e.g. `image_001.jpg`). This script merges them into a single directory with automatic prefixing:
 
 ```python
 import os
@@ -106,21 +138,20 @@ if __name__ == "__main__":
         output_dir="dataset_merged_thermal",
         dataset_prefixes=["maor", "nguyn"]
     )
-    
+
     # Example: Merge Optical Datasets
     merge_yolo_datasets(
         source_dirs=["path/to/rgb_1", "path/to/rgb_2"],
         output_dir="dataset_merged_rgb",
         dataset_prefixes=["uav_aug", "drone_uskpc"]
     )
-
 ```
 
 ---
 
 ## 🏋️ Model Training Guide (Kaggle / Google Colab)
 
-Both models were trained using the **Ultralytics YOLO11** framework on cloud GPUs.
+Both models were trained with the **Ultralytics YOLO11** framework on cloud GPUs.
 
 ```python
 from ultralytics import YOLO
@@ -147,54 +178,45 @@ model.train(
     device=0,
     name="rgb_drone_model"
 )
-
 ```
 
 ---
 
 ## ⚙️ Installation & Usage
 
-1. **Clone the Repository:**
-```bash
-git clone https://github.com/your-username/aegis-cuas-hpm.git
-cd aegis-cuas-hpm
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/FarhanRana234/Aegis-C-UAS.git
+   cd Aegis-C-UAS
+   ```
 
-```
+2. **Install dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
+3. **Place model weights and test videos**
+   - `models/thermal_best.pt` – custom trained thermal weights  
+   - `models/rgb_best.pt` – optical weights  
+   - `IR_videos/ir_test.mp4` – sample IR stream  
+   - `RGB_videos/rgb_test1.mp4` – sample RGB stream  
 
-2. **Install Dependencies:**
-```bash
-pip install ultralytics scikit-learn opencv-python numpy roboflow
-
-```
-
-
-3. **Configure Project Files:**
-* Place your trained thermal weights in `models/thermal_best.pt`.
-* Place sample video files in `IR_videos/ir_test.mp4` and `RGB_videos/rgb_test1.mp4`.
-
-
-4. **Run the GCS Command & Control Interface:**
-```bash
-python main.py
-
-```
-
-
-* *Press `q` within the video display window to terminate execution safely.*
-
-
+4. **Run the GCS interface**
+   ```bash
+   python main.py
+   ```
+   Press `q` in the video window to exit cleanly.
 
 ---
 
 ## 🗂️ Project Directory Structure
 
 ```text
-aegis-cuas-hpm/
+Aegis-C-UAS/
 │
 ├── models/
 │   ├── thermal_best.pt      # Custom trained thermal weights
-│   └── yolo11n.pt           # Base/fine-tuned optical weights
+│   └── rgb_best.pt          # Optical weights
 │
 ├── IR_videos/
 │   └── ir_test.mp4          # Sample IR test stream
@@ -203,9 +225,14 @@ aegis-cuas-hpm/
 │   └── rgb_test1.mp4        # Sample RGB test stream
 │
 ├── main.py                  # Core GCS control & tracking loop
-├── merge_datasets.py        # Dataset combination utility script
-├── requirements.txt         # Project dependencies
-└── README.md                # Project documentation
-
+├── requirements.txt         # Python dependencies
+└── README.md                # This file
 ```
 
+---
+
+## Licence & Disclaimer
+
+This repository is provided for educational and research purposes only.  
+It is a software prototype and does not constitute a complete or operational Counter-UAS system.
+```
