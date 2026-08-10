@@ -1,4 +1,4 @@
-```markdown
+
 # Aegis C-UAS (Counter-Unmanned Aerial Systems)
 
 A dual-sensor Ground Control Station (GCS) and computer vision tracking pipeline for Counter-UAS applications.  
