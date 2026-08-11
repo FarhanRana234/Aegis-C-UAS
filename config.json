@@ -1,0 +1,20 @@
+{
+  "device": "cpu",
+  "thermal_model_path": "models/thermal_best.pt",
+  "rgb_model_path": "models/rgb_best.pt",
+  "ir_source": "IR_videos/infrared.mp4",
+  "rgb_source": "RGB_videos/visible.mp4",
+  "frame_width": 640,
+  "frame_height": 480,
+  "thermal_confidence": 0.4,
+  "rgb_confidence": 0.3,
+  "max_coast_frames": 15,
+  "dbscan_eps": 250,
+  "dbscan_min_samples": 2,
+  "ir_static_distance_threshold": 2.0,
+  "ir_static_max_frames": 30,
+  "rgb_static_distance_threshold": 3.0,
+  "rgb_static_max_frames": 30,
+  "min_box_width": 12,
+  "min_box_height": 12
+}
