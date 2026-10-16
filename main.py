@@ -1,381 +1,448 @@
+"""Aegis C-UAS v2: dual-sensor (thermal IR + optical RGB) single-target tracker.
+
+Changes from v1:
+  - DBSCAN swarm clustering removed. One target is locked at a time.
+  - Target priority score with switching hysteresis (no box jumping).
+  - Kalman filter on the locked target: smooth position, predicted coasting, optional lead.
+  - Tracker logic now runs once per NEW frame (v1 ran it every loop iteration).
+  - Optional aim output to an ESP32 over serial (aim only; no launcher control here).
+  - Sources can be video files, camera indexes (0, 1) or stream URLs (e.g. ESP32-CAM).
+  - Headless mode, per-stream inference timing, everything tunable from config.json.
+  - Operator display: ranked target list with scores, swarm alert banner (simple
+    distance grouping, no scikit-learn), click a box to force the lock.
+    Keys: q quit | a back to auto-select | r release lock.
+
+Usage: python main.py [config.json]      Press q in the window (or Ctrl+C) to quit.
+"""
 import json
+import math
+import struct
+import sys
 import time
+
 import cv2
 import numpy as np
-from sklearn.cluster import DBSCAN
+import torch
+import torch_directml
 from ultralytics import YOLO
 
-with open("config.json", "r") as f:
-  config = json.load(f)
+with open(sys.argv[1] if len(sys.argv) > 1 else "config.json") as f:
+    cfg = json.load(f)
 
-DEVICE = config["device"]
-ir_model = YOLO(config["thermal_model_path"])
-rgb_model = YOLO(config["rgb_model_path"])
-
-cap_ir = cv2.VideoCapture(config["ir_source"])
-cap_rgb = cv2.VideoCapture(config["rgb_source"])
-
-FRAME_W = config["frame_width"]
-FRAME_H = config["frame_height"]
+W, H = cfg["frame_width"], cfg["frame_height"]
+DIAG = math.hypot(W, H)
 BANNER_H = 45
 
+if cfg.get("device") in ["cuda", "dml", "gpu"]:
+    device = torch_directml.device()
+else:
+    device = "cpu"
 
-class TrackerState:
+def largest_group_size(dets, eps):
+    """Size of the biggest cluster of detections whose centres chain within eps pixels.
+    Display only: this never influences which target is locked."""
+    n = len(dets)
+    if n < 2:
+        return n
+    parent = list(range(n))
 
-  def __init__(self):
-    self.locked_track_id = None
-    self.last_box = None
-    self.last_center = None
-    self.missing_frames = 0
-    self.max_coast_frames = config["max_coast_frames"]
-    self.status = "SEARCHING"
-    self.track_history = {}
-    self.track_spawn_pos = {}
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
 
-
-ir_state = TrackerState()
-rgb_state = TrackerState()
-
-
-def process_pipeline_logic(boxes_data, state, stream_label="Target"):
-  boxes, confs, track_ids = [], [], []
-
-  if boxes_data is not None and len(boxes_data) > 0:
-    xyxy = boxes_data.xyxy.cpu().numpy()
-    conf_vals = boxes_data.conf.cpu().numpy()
-    ids = boxes_data.id.cpu().numpy() if boxes_data.id is not None else None
-
-    min_w = config.get("min_box_width", 12)
-    min_h = config.get("min_box_height", 12)
-    min_ar = config.get("min_aspect_ratio", 0.25)
-    max_ar = config.get("max_aspect_ratio", 4.0)
-
-    current_frame_ids = set()
-    valid_boxes, valid_confs, valid_ids = [], [], []
-
-    for i in range(len(xyxy)):
-      b = xyxy[i][:4]
-      w = b[2] - b[0]
-      h = b[3] - b[1]
-
-      # 1. Size Filter
-      if w < min_w or h < min_h:
-        continue
-
-      # 2. Aspect Ratio Filter (Poles)
-      aspect_ratio = w / (h + 1e-5)
-      if aspect_ratio < min_ar or aspect_ratio > max_ar:
-        continue
-
-      tid = int(ids[i]) if ids is not None else i
-      current_frame_ids.add(tid)
-
-      center_x = (b[0] + b[2]) / 2
-      center_y = (b[1] + b[3]) / 2
-
-      if tid not in state.track_history:
-        state.track_history[tid] = []
-        state.track_spawn_pos[tid] = (center_x, center_y)
-
-      state.track_history[tid].append((center_x, center_y))
-      if len(state.track_history[tid]) > 30:
-        state.track_history[tid].pop(0)
-
-      # 3. Motion-Gate Filter: Drop tracks that stay anchored to their spawn point (Clouds/Static Clutter)
-      if len(state.track_history[tid]) >= 15:
-        spawn_x, spawn_y = state.track_spawn_pos[tid]
-        distance_from_birth = np.hypot(center_x - spawn_x, center_y - spawn_y)
-        # If it has been tracked for 15+ frames but hasn't moved at least 8 pixels from where it appeared, it's a cloud
-        if distance_from_birth < 8.0:
-          continue
-
-      valid_boxes.append(b)
-      valid_confs.append(float(conf_vals[i]))
-      valid_ids.append(tid)
-
-    # Cleanup stale history and spawn positions
-    stale_keys = [
-        k for k in state.track_history if k not in current_frame_ids
-    ]
-    for k in stale_keys:
-      del state.track_history[k]
-      if k in state.track_spawn_pos:
-        del state.track_spawn_pos[k]
-
-    boxes, confs, track_ids = valid_boxes, valid_confs, valid_ids
-
-  dbscan_eps = (
-      config["ir_dbscan_eps"]
-      if stream_label == "IR"
-      else config["rgb_dbscan_eps"]
-  )
-  dbscan_min_samples = (
-      config["ir_dbscan_min_samples"]
-      if stream_label == "IR"
-      else config["rgb_dbscan_min_samples"]
-  )
-
-  if len(boxes) == 0:
-    if (
-        state.last_box is not None
-        and state.missing_frames < state.max_coast_frames
-    ):
-      state.missing_frames += 1
-      state.status = f"COASTING ({state.missing_frames})"
-      return state.last_box, state.last_center, state.status, "COAST", []
-    else:
-      state.status, state.locked_track_id = "SEARCHING", None
-      state.last_box, state.last_center = None, None
-      return None, None, state.status, "SEARCHING", []
-
-  state.missing_frames = 0
-
-  # --- PRIORITY 1: EVALUATE SWARM CLUSTERING FIRST ---
-  if len(boxes) > 1:
-    centers = np.array([[(b[0] + b[2]) / 2, (b[1] + b[3]) / 2] for b in boxes])
-    clustering = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples).fit(
-        centers
-    )
-    labels = clustering.labels_
-    unique_labels, counts = np.unique(labels[labels != -1], return_counts=True)
-
-    if len(unique_labels) > 0:
-      main_cluster_label = unique_labels[np.argmax(counts)]
-      main_swarm_boxes = [
-          boxes[i] for i in range(len(boxes)) if labels[i] == main_cluster_label
-      ]
-
-      if len(main_swarm_boxes) > 1:
-        min_x = min(b[0] for b in main_swarm_boxes)
-        min_y = min(b[1] for b in main_swarm_boxes)
-        max_x = max(b[2] for b in main_swarm_boxes)
-        max_y = max(b[3] for b in main_swarm_boxes)
-        state.last_box = np.array([min_x, min_y, max_x, max_y], dtype=np.float32)
-        state.last_center = (int((min_x + max_x) / 2), int((min_y + max_y) / 2))
-        state.status = "SWARM LOCKED"
-        state.locked_track_id = None
-        return (
-            state.last_box,
-            state.last_center,
-            state.status,
-            "SWARM",
-            main_swarm_boxes,
-        )
-
-  # --- PRIORITY 2: SINGLE TARGET FALLBACK ---
-  if len(boxes) == 1:
-    selected_idx = 0
-  elif state.locked_track_id in track_ids:
-    selected_idx = track_ids.index(state.locked_track_id)
-  elif state.last_center is not None:
-    selected_idx = np.argmin(
-        [
-            np.hypot(
-                ((b[0] + b[2]) / 2) - state.last_center[0],
-                ((b[1] + b[3]) / 2) - state.last_center[1],
-            )
-            for b in boxes
-        ]
-    )
-  else:
-    selected_idx = np.argmax(confs)
-
-  chosen_box = boxes[selected_idx]
-  state.locked_track_id = track_ids[selected_idx]
-  state.last_box = chosen_box
-  state.last_center = (
-      int((chosen_box[0] + chosen_box[2]) / 2),
-      int((chosen_box[1] + chosen_box[3]) / 2),
-  )
-  state.status = "LOCKED"
-  return state.last_box, state.last_center, state.status, "SINGLE", [chosen_box]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if math.hypot(dets[i]["cx"] - dets[j]["cx"], dets[i]["cy"] - dets[j]["cy"]) <= eps:
+                parent[find(i)] = find(j)
+    sizes = {}
+    for i in range(n):
+        r = find(i)
+        sizes[r] = sizes.get(r, 0) + 1
+    return max(sizes.values())
 
 
-print("Starting Aegis C-UAS Command & Control Interface...")
+# --------------------------------------------------------------------------
+# Kalman filter (constant velocity, time step = one processed frame)
+# --------------------------------------------------------------------------
+class KalmanCV:
+    def __init__(self, accel_var, meas_sigma):
+        self.F = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], float)
+        G = np.array([[0.5, 0], [0, 0.5], [1, 0], [0, 1]], float)
+        self.Q = accel_var * (G @ G.T)
+        self.H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], float)
+        self.R = np.eye(2) * meas_sigma ** 2
+        self.x = np.zeros(4)
+        self.P = np.eye(4)
 
-fps_ir = cap_ir.get(cv2.CAP_PROP_FPS) or 30
-fps_rgb = cap_rgb.get(cv2.CAP_PROP_FPS) or 3
-interval_ir, interval_rgb = 1.0 / fps_ir, 1.0 / fps_rgb
-next_ir_time, next_rgb_time = time.time(), time.time()
+    def reset(self, cx, cy):
+        self.x = np.array([cx, cy, 0.0, 0.0])
+        self.P = np.diag([25.0, 25.0, 400.0, 400.0])
 
-ret_ir, frame_ir = cap_ir.read()
-ret_rgb, frame_rgb = cap_rgb.read()
-res_ir_boxes, res_rgb_boxes = None, None
+    def predict(self):
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
 
-while cap_ir.isOpened() and cap_rgb.isOpened():
-  current_time = time.time()
+    def update(self, cx, cy):
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ (np.array([cx, cy]) - self.H @ self.x)
+        self.P = (np.eye(4) - K @ self.H) @ self.P
 
-  if current_time >= next_ir_time:
-    ret_ir, frame_ir = cap_ir.read()
-    if not ret_ir:
-      break
-    next_ir_time = current_time + interval_ir
-    if frame_ir is not None:
-      frame_ir = cv2.resize(frame_ir, (FRAME_W, FRAME_H))
-      res_ir = ir_model.track(
-          frame_ir,
-          conf=config["thermal_confidence"],
-          persist=True,
-          tracker="bytetrack.yaml",
-          verbose=False,
-          device=DEVICE,
-      )[0]
-      res_ir_boxes = res_ir.boxes
 
-  if current_time >= next_rgb_time:
-    ret_rgb, frame_rgb = cap_rgb.read()
-    if not ret_rgb:
-      break
-    next_rgb_time = current_time + interval_rgb
-    if frame_rgb is not None:
-      frame_rgb = cv2.resize(frame_rgb, (FRAME_W, FRAME_H))
-      res_rgb = rgb_model.track(
-          frame_rgb,
-          conf=config["rgb_confidence"],
-          persist=True,
-          tracker="bytetrack.yaml",
-          verbose=False,
-          device=DEVICE,
-      )[0]
-      res_rgb_boxes = res_rgb.boxes
+# --------------------------------------------------------------------------
+# Per-stream tracker: filters, target priority, lock, coast
+# --------------------------------------------------------------------------
+class StreamTracker:
+    def __init__(self, group_eps):
+        self.eps = group_eps
+        self.manual = False          # operator forced the lock
+        self.dets, self.ranked, self.group = [], [], 0
+        self.history, self.spawn = {}, {}
+        self.kf = KalmanCV(cfg["kalman_accel_var"], cfg["kalman_meas_sigma"])
+        self.locked, self.locked_id = False, None
+        self.missing, self.challenge = 0, 0
+        self.last_wh = (0.0, 0.0)
+        self.status = "SEARCHING"
+        self.box, self.center = None, None
 
-  if frame_ir is None or frame_rgb is None:
-    break
+    # ---- filtering (size, aspect ratio, static-clutter gate) ----
+    def filter_detections(self, boxes):
+        dets, seen = [], set()
+        if boxes is not None and len(boxes) > 0:
+            xyxy = boxes.xyxy.cpu().numpy()
+            confs = boxes.conf.cpu().numpy()
+            ids = boxes.id.cpu().numpy() if boxes.id is not None else None
+            for i in range(len(xyxy)):
+                x1, y1, x2, y2 = (float(v) for v in xyxy[i][:4])
+                w, h = x2 - x1, y2 - y1
+                
+                # --- DEBUG LOGGING ---
+                if w < cfg["min_box_width"] or h < cfg["min_box_height"]:
+                    print(f"[DROP] Box too small: {w:.1f}x{h:.1f} (min {cfg['min_box_width']})")
+                    continue
+                ar = w / (h + 1e-5)
+                if ar < cfg["min_aspect_ratio"] or ar > cfg["max_aspect_ratio"]:
+                    print(f"[DROP] Aspect ratio out of bounds: {ar:.2f}")
+                    continue
+                
+                tid = int(ids[i]) if ids is not None else -(i + 1)
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                seen.add(tid)
+                hist = self.history.setdefault(tid, [])
+                self.spawn.setdefault(tid, (cx, cy))
+                hist.append((cx, cy))
+                if len(hist) > 30:
+                    hist.pop(0)
+                
+                if (cfg["static_gate_enabled"] and tid != self.locked_id
+                        and len(hist) >= cfg["static_gate_frames"]):
+                    sx, sy = self.spawn[tid]
+                    if math.hypot(cx - sx, cy - sy) < cfg["static_gate_px"]:
+                        print(f"[DROP] Static clutter gate triggered for id {tid}")
+                        continue
+                
+                dets.append(dict(tid=tid, cx=cx, cy=cy, w=w, h=h, conf=float(confs[i]),
+                                 age=len(hist), box=(x1, y1, x2, y2)))
+        for k in [k for k in self.history if k not in seen]:
+            self.history.pop(k, None)
+            self.spawn.pop(k, None)
+        return dets
 
-  display_ir, display_rgb = frame_ir.copy(), frame_rgb.copy()
+    # ---- target priority: bigger, nearer the centre, more confident, older ----
+    def score(self, d):
+        w = cfg["priority_weights"]
+        size = min(math.sqrt(d["w"] * d["h"]) / (cfg["priority_size_ref"] * DIAG), 1.0)
+        centre = 1 - math.hypot(d["cx"] - W / 2, d["cy"] - H / 2) / (DIAG / 2)
+        age = min(d["age"] / 30.0, 1.0)
+        return w["size"] * size + w["center"] * centre + w["conf"] * d["conf"] + w["age"] * age
 
-  ir_box, ir_center, ir_status, ir_mode, raw_ir_boxes = process_pipeline_logic(
-      res_ir_boxes, ir_state, stream_label="IR"
-  )
-  if ir_box is not None:
-    x1, y1, x2, y2 = map(int, ir_box)
-    if ir_mode == "SWARM":
-      cv2.rectangle(display_ir, (x1, y1), (x2, y2), (255, 0, 255), 3)
-      for b in raw_ir_boxes:
-        bx1, by1, bx2, by2 = map(int, b)
-        cv2.rectangle(display_ir, (bx1, by1), (bx2, by2), (255, 255, 0), 1)
-    else:
-      cv2.rectangle(
-          display_ir,
-          (x1, y1),
-          (x2, y2),
-          (0, 0, 255) if ir_mode == "SINGLE" else (0, 165, 255),
-          2,
-      )
+    def _lock(self, d):
+        self.kf.reset(d["cx"], d["cy"])
+        self.locked, self.locked_id = True, d["tid"]
+        self.last_wh = (d["w"], d["h"])
+        self.missing, self.challenge = 0, 0
+        self.status = self._locked_status()
 
-    if ir_center:
-      cv2.circle(display_ir, ir_center, 5, (0, 255, 0), -1)
-      cv2.putText(
-          display_ir,
-          f"IR Target {ir_center}",
-          (x1, max(y1 - 10, 20)),
-          cv2.FONT_HERSHEY_SIMPLEX,
-          0.5,
-          (0, 0, 255),
-          2,
-      )
+    def _locked_status(self):
+        return "LOCKED (MANUAL)" if self.manual else "LOCKED"
 
-  rgb_box, rgb_center, rgb_status, rgb_mode, raw_boxes = process_pipeline_logic(
-      res_rgb_boxes, rgb_state, stream_label="RGB"
-  )
-  if rgb_box is not None:
-    x1, y1, x2, y2 = map(int, rgb_box)
-    if rgb_mode == "SWARM":
-      cv2.rectangle(display_rgb, (x1, y1), (x2, y2), (255, 0, 255), 3)
-      for b in raw_boxes:
-        bx1, by1, bx2, by2 = map(int, b)
-        cv2.rectangle(display_rgb, (bx1, by1), (bx2, by2), (255, 255, 0), 1)
-    else:
-      cv2.rectangle(
-          display_rgb,
-          (x1, y1),
-          (x2, y2),
-          (0, 0, 255) if rgb_mode == "SINGLE" else (0, 165, 255),
-          2,
-      )
+    def manual_lock(self, det):
+        self._lock(det)
+        self.manual = True
+        self.status = self._locked_status()
+        self._publish()
 
-    if rgb_center:
-      cv2.circle(display_rgb, rgb_center, 6, (0, 255, 0), -1)
-      cv2.putText(
-          display_rgb,
-          f"Optical Target {rgb_center}",
-          (x1, max(y1 - 10, 20)),
-          cv2.FONT_HERSHEY_SIMPLEX,
-          0.5,
-          (0, 0, 255),
-          2,
-      )
+    def _release(self):
+        self.locked, self.locked_id = False, None
+        self.manual = False
+        self.missing, self.challenge = 0, 0
+        self.status = "SEARCHING"
 
-  cv2.putText(
-      display_ir,
-      "SENSOR 01: THERMAL IR",
-      (15, 30),
-      cv2.FONT_HERSHEY_SIMPLEX,
-      0.6,
-      (0, 255, 255),
-      2,
-  )
-  cv2.putText(
-      display_rgb,
-      "SENSOR 02: OPTICAL RGB",
-      (15, 30),
-      cv2.FONT_HERSHEY_SIMPLEX,
-      0.6,
-      (0, 255, 255),
-      2,
-  )
-  cv2.putText(
-      display_ir,
-      f"STATUS: {ir_status}",
-      (15, 60),
-      cv2.FONT_HERSHEY_SIMPLEX,
-      0.55,
-      (0, 255, 0),
-      2,
-  )
-  cv2.putText(
-      display_rgb,
-      f"STATUS: {rgb_status}",
-      (15, 60),
-      cv2.FONT_HERSHEY_SIMPLEX,
-      0.55,
-      (0, 255, 0),
-      2,
-  )
+    def step(self, dets):
+        if self.locked:
+            self.kf.predict()
+            px, py = self.kf.x[0], self.kf.x[1]
+            match = next((d for d in dets if d["tid"] == self.locked_id), None)
+            if match is None and dets:  # ByteTrack may have re-issued the ID
+                near = min(dets, key=lambda d: math.hypot(d["cx"] - px, d["cy"] - py))
+                if math.hypot(near["cx"] - px, near["cy"] - py) <= cfg["gate_px"]:
+                    match = near
+            if match is not None:
+                self.kf.update(match["cx"], match["cy"])
+                self.locked_id = match["tid"]
+                self.last_wh = (match["w"], match["h"])
+                self.missing, self.status = 0, self._locked_status()
+                others = [d for d in dets if d is not match]
+                best = max(others, key=self.score) if others else None
+                if (not self.manual and best
+                        and self.score(best) > self.score(match) * (1 + cfg["switch_margin"])):
+                    self.challenge += 1
+                else:
+                    self.challenge = 0
+                if not self.manual and best and self.challenge >= cfg["switch_hold_frames"]:
+                    self._lock(best)
+            else:
+                self.missing += 1
+                self.kf.x[2:] *= 0.9  # damp velocity so a long coast does not run away
+                if self.missing > cfg["max_coast_frames"]:
+                    self._release()
+                else:
+                    self.status = f"COASTING ({self.missing})"
+        elif dets:
+            self._lock(max(dets, key=self.score))
+        self.dets = dets
+        self.ranked = sorted(((self.score(d), d) for d in dets), key=lambda t: t[0], reverse=True)
+        self.group = largest_group_size(dets, self.eps)
+        self._publish()
 
-  feeds_view = np.hstack((display_ir, display_rgb))
-  cv2.line(feeds_view, (FRAME_W, 0), (FRAME_W, FRAME_H), (50, 50, 50), 3)
+    def _publish(self):
+        if not self.locked:
+            self.box = self.center = None
+            return
+        lead = cfg["lead_frames"]
+        cx = self.kf.x[0] + self.kf.x[2] * lead
+        cy = self.kf.x[1] + self.kf.x[3] * lead
+        w, h = self.last_wh
+        self.box = (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+        self.center = (cx, cy)
 
-  banner = np.zeros((BANNER_H, FRAME_W * 2, 3), dtype=np.uint8)
-  banner[:] = (25, 25, 25)
-  timestamp_str = time.strftime(
-      "%Y-%m-%d %H:%M:%S", time.localtime(current_time)
-  )
-  cv2.putText(
-      banner,
-      "AEGIS C-UAS COMMAND & CONTROL SYSTEM",
-      (20, 28),
-      cv2.FONT_HERSHEY_SIMPLEX,
-      0.6,
-      (255, 255, 255),
-      2,
-  )
-  cv2.putText(
-      banner,
-      f"SYS TIME: {timestamp_str} | MODE: ACTIVE TRACKING",
-      (FRAME_W + 40, 28),
-      cv2.FONT_HERSHEY_SIMPLEX,
-      0.5,
-      (0, 200, 255),
-      1,
-  )
 
-  combined_view = np.vstack((banner, feeds_view))
-  cv2.imshow("Aegis C-UAS Command & Control Interface", combined_view)
+# --------------------------------------------------------------------------
+# ESP32 serial link (aim only). Launcher stays under ESP32 firmware + hardware arm switch.
+# Packet: 0xA5 | cmd(1) seq(2) pan_mrad(2) tilt_mrad(2) flags(1) | xor checksum
+# flags bit0 = track valid. ESP32 should zero motion if no packet for ~150 ms.
+# --------------------------------------------------------------------------
+class Esp32Link:
+    def __init__(self, c):
+        self.ser, self.seq = None, 0
+        if c.get("enabled"):
+            import serial
+            self.ser = serial.Serial(c["port"], c["baud"], timeout=0)
 
-  if cv2.waitKey(1) & 0xFF == ord("q"):
-    break
+    def send(self, pan_rad, tilt_rad, valid):
+        if self.ser is None:
+            return
+        body = struct.pack("<BHhhB", 0x01, self.seq & 0xFFFF,
+                           int(pan_rad * 1000), int(tilt_rad * 1000), 1 if valid else 0)
+        crc = 0
+        for b in body:
+            crc ^= b
+        self.ser.write(bytes([0xA5]) + body + bytes([crc]))
+        self.seq += 1
 
-cap_ir.release()
-cap_rgb.release()
-cv2.destroyAllWindows()
+    def close(self):
+        if self.ser:
+            self.ser.close()
+
+
+def px_to_angles(cx, cy):
+    fx = (W / 2) / math.tan(math.radians(cfg["camera_hfov_deg"]) / 2)
+    pan = math.atan((cx - W / 2) / fx)
+    tilt = math.atan((cy - H / 2) / fx)
+    return pan, (-tilt if cfg["invert_tilt"] else tilt)
+
+
+# --------------------------------------------------------------------------
+# I/O helpers
+# --------------------------------------------------------------------------
+def open_source(s):
+    cap = cv2.VideoCapture(int(s) if str(s).isdigit() else s)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
+def read_frame(cap):
+    ok, fr = cap.read()
+    if not ok and cfg["loop_videos"]:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ok, fr = cap.read()
+    return cv2.resize(fr, (W, H)) if ok else None
+
+
+def infer(model, frame, conf):
+    return model.track(frame, conf=conf, persist=True, tracker="bytetrack.yaml",
+                       imgsz=cfg["inference_imgsz"], verbose=False,
+                       device=device)[0].boxes
+
+def render(frame, tr, title):
+    cv2.line(frame, (W // 2 - 12, H // 2), (W // 2 + 12, H // 2), (90, 90, 90), 1)
+    cv2.line(frame, (W // 2, H // 2 - 12), (W // 2, H // 2 + 12), (90, 90, 90), 1)
+    rank_of = {}
+    for rank, (_, d) in enumerate(tr.ranked, 1):
+        rank_of[d["tid"]] = rank
+        if tr.locked and d["tid"] == tr.locked_id:
+            continue  # drawn below as the locked target
+        x1, y1, x2, y2 = map(int, d["box"])
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 1)
+        cv2.putText(frame, f"T{rank}", (x1, max(y1 - 5, 15)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+    if tr.box is not None:
+        x1, y1, x2, y2 = map(int, tr.box)
+        color = (0, 0, 255) if tr.status.startswith("LOCKED") else (0, 165, 255)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        c = (int(tr.center[0]), int(tr.center[1]))
+        cv2.circle(frame, c, 5, (0, 255, 0), -1)
+        cv2.putText(frame, f"T{rank_of.get(tr.locked_id, '-')} TARGET {c}", (x1, max(y1 - 10, 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    cv2.putText(frame, title, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    cv2.putText(frame, f"STATUS: {tr.status}", (15, 60), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (0, 255, 0), 2)
+    return frame
+
+
+def panel(ir_tr, rgb_tr):
+    rows = cfg["panel_rows"]
+    ph = 28 + rows * 18 + 8
+    img = np.full((ph, W * 2, 3), 18, np.uint8)
+    for k, (label, tr) in enumerate((("IR", ir_tr), ("RGB", rgb_tr))):
+        x0 = k * W + 15
+        cv2.putText(img, f"{label} TARGETS: {len(tr.dets)}   LARGEST GROUP: {tr.group}",
+                    (x0, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+        for i, (sc, d) in enumerate(tr.ranked[:rows], 1):
+            mark = ">" if (tr.locked and d["tid"] == tr.locked_id) else " "
+            line = f"{mark} T{i}  id {d['tid']:<4} score {sc:.2f}  conf {d['conf']:.2f}  ({d['cx']:.0f},{d['cy']:.0f})"
+            col = (0, 0, 255) if mark == ">" else (210, 210, 210)
+            cv2.putText(img, line, (x0, 28 + i * 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+    cv2.line(img, (W, 0), (W, ph), (50, 50, 50), 2)
+    return img
+
+
+def compose(disp_ir, disp_rgb, now, ir_tr, rgb_tr):
+    feeds = np.hstack((disp_ir, disp_rgb))
+    cv2.line(feeds, (W, 0), (W, H), (50, 50, 50), 3)
+    banner = np.full((BANNER_H, W * 2, 3), 25, np.uint8)
+    cv2.putText(banner, "AEGIS C-UAS COMMAND & CONTROL SYSTEM", (20, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    n = max(ir_tr.group, rgb_tr.group)
+    if n >= cfg["swarm_alert_size"]:
+        cv2.putText(banner, f"SWARM ALERT x{n}", (450, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+    cv2.putText(banner, f"SYS TIME: {ts} | MODE: ACTIVE TRACKING", (W + 40, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+    return np.vstack((banner, feeds, panel(ir_tr, rgb_tr)))
+
+
+def select_at(x, y, ir_tr, rgb_tr):
+    """Click in the combined window -> force-lock the target box under the cursor."""
+    y -= BANNER_H
+    if not (0 <= y < H) or not (0 <= x < 2 * W):
+        return
+    tr, x = (ir_tr, x) if x < W else (rgb_tr, x - W)
+    hits = [d for _, d in tr.ranked
+            if d["box"][0] - 6 <= x <= d["box"][2] + 6 and d["box"][1] - 6 <= y <= d["box"][3] + 6]
+    if hits:
+        tr.manual_lock(min(hits, key=lambda d: d["w"] * d["h"]))
+
+
+# --------------------------------------------------------------------------
+def main():
+    print("Starting Aegis C-UAS v2...")
+    ir_model, rgb_model = YOLO(cfg["thermal_model_path"]), YOLO(cfg["rgb_model_path"])
+    cap_ir, cap_rgb = open_source(cfg["ir_source"]), open_source(cfg["rgb_source"])
+    iv_ir = 1.0 / (cap_ir.get(cv2.CAP_PROP_FPS) or 30)
+    iv_rgb = 1.0 / (cap_rgb.get(cv2.CAP_PROP_FPS) or 30)
+    ir_tr = StreamTracker(cfg["group_eps"]["ir"])
+    rgb_tr = StreamTracker(cfg["group_eps"]["rgb"])
+    link = Esp32Link(cfg["esp32"])
+    show = cfg["show_window"]
+    win = "Aegis C-UAS Command & Control Interface"
+    if show:
+        cv2.namedWindow(win)
+        cv2.setMouseCallback(
+            win, lambda ev, x, y, fl, p: ev == cv2.EVENT_LBUTTONDOWN and select_at(x, y, ir_tr, rgb_tr))
+    disp_ir = np.zeros((H, W, 3), np.uint8)
+    disp_rgb = disp_ir.copy()
+    next_ir = next_rgb = time.time()
+    ms = {"IR": 0.0, "RGB": 0.0}
+    t_log = time.time()
+
+    try:
+        while True:
+            now, updated = time.time(), False
+
+            if now >= next_ir:
+                fr = read_frame(cap_ir)
+                if fr is None:
+                    break
+                next_ir = now + iv_ir
+                t0 = time.time()
+                boxes = infer(ir_model, fr, cfg["thermal_confidence"])
+                ms["IR"] = (time.time() - t0) * 1000
+                ir_tr.step(ir_tr.filter_detections(boxes))
+                disp_ir = render(fr, ir_tr, "SENSOR 01: THERMAL IR")
+                updated = True
+
+            if now >= next_rgb:
+                fr = read_frame(cap_rgb)
+                if fr is None:
+                    break
+                next_rgb = now + iv_rgb
+                t0 = time.time()
+                boxes = infer(rgb_model, fr, cfg["rgb_confidence"])
+                ms["RGB"] = (time.time() - t0) * 1000
+                rgb_tr.step(rgb_tr.filter_detections(boxes))
+                disp_rgb = render(fr, rgb_tr, "SENSOR 02: OPTICAL RGB")
+                updated = True
+
+            if updated:
+                order = (rgb_tr, ir_tr) if cfg["aim_sensor"] == "rgb" else (ir_tr, rgb_tr)
+                src = (next((t for t in order if t.locked and t.manual), None)
+                       or next((t for t in order if t.locked), None))
+                if src:
+                    pan, tilt = px_to_angles(*src.center)
+                    link.send(pan, tilt, True)
+                else:
+                    link.send(0.0, 0.0, False)
+                if show:
+                    cv2.imshow(win, compose(disp_ir, disp_rgb, now, ir_tr, rgb_tr))
+
+            if show:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                if key == ord("a"):      # back to automatic target selection
+                    ir_tr.manual = rgb_tr.manual = False
+                if key == ord("r"):      # release both locks
+                    ir_tr._release()
+                    rgb_tr._release()
+            time.sleep(0.001)
+
+            if now - t_log > 2.0:
+                print(f"inference ms  IR {ms['IR']:.0f} | RGB {ms['RGB']:.0f}   "
+                      f"IR {ir_tr.status} | RGB {rgb_tr.status}")
+                t_log = now
+    except KeyboardInterrupt:
+        pass
+    finally:
+        link.send(0.0, 0.0, False)
+        link.close()
+        cap_ir.release()
+        cap_rgb.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
