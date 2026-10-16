@@ -10,7 +10,7 @@
   "frame_height": 480,
   "inference_imgsz": 640,
   "thermal_confidence": 0.4,
-  "rgb_confidence": 0.3,
+  "rgb_confidence": 0.4,
   "min_box_width": 12,
   "min_box_height": 12,
   "min_aspect_ratio": 0.25,
@@ -35,6 +35,20 @@
   "aim_sensor": "rgb",
   "camera_hfov_deg": 60,
   "invert_tilt": false,
+  "camera_offsets": {
+    "rgb": {
+      "x": 0,
+      "y": 0
+    },
+    "ir": {
+      "x": 0,
+      "y": 0
+    }
+  },
+  "auto_shoot_enabled": false,
+  "auto_shoot_confidence": 0.65,
+  "auto_shoot_min_age": 15,
+  "fire_cooldown": 2.0,
   "esp32": {
     "enabled": false,
     "port": "/dev/ttyUSB0",

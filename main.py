@@ -1,16 +1,12 @@
-"""Aegis C-UAS v2: dual-sensor (thermal IR + optical RGB) single-target tracker.
+"""C-UAV v2: dual-sensor (thermal IR + optical RGB) single-target tracker.
 
-Changes from v1:
-  - DBSCAN swarm clustering removed. One target is locked at a time.
-  - Target priority score with switching hysteresis (no box jumping).
-  - Kalman filter on the locked target: smooth position, predicted coasting, optional lead.
-  - Tracker logic now runs once per NEW frame (v1 ran it every loop iteration).
-  - Optional aim output to an ESP32 over serial (aim only; no launcher control here).
-  - Sources can be video files, camera indexes (0, 1) or stream URLs (e.g. ESP32-CAM).
-  - Headless mode, per-stream inference timing, everything tunable from config.json.
-  - Operator display: ranked target list with scores, swarm alert banner (simple
-    distance grouping, no scikit-learn), click a box to force the lock.
-    Keys: q quit | a back to auto-select | r release lock.
+Interactive UI Version with Manual & Auto-Shoot Interception:
+  - Click [ AIM: RGB/IR ] to toggle active aim sensor.
+  - Click [ RELEASE LOCK ] to clear targets.
+  - Click [ LOGS: ON/OFF ] (or 'l') to toggle on-screen terminal.
+  - Click [ AUTO: ON/OFF ] (or 'space') to toggle automated interception firing.
+  - Click [ FIRE ] button (or press 'f') to send a manual interception shoot command.
+  - Click any bounding box to force-lock it.
 
 Usage: python main.py [config.json]      Press q in the window (or Ctrl+C) to quit.
 """
@@ -38,9 +34,22 @@ if cfg.get("device") in ["cuda", "dml", "gpu"]:
 else:
     device = "cpu"
 
+# --------------------------------------------------------------------------
+# Dual-Destination Logging
+# --------------------------------------------------------------------------
+LOG_BUFFER = []
+MAX_LOG_LINES = 7
+
+def log_message(msg):
+    """Prints to VS Code terminal and appends to the live GUI terminal buffer."""
+    print(msg)
+    timestamp = time.strftime("[%H:%M:%S]")
+    LOG_BUFFER.append(f"{timestamp} {msg}")
+    if len(LOG_BUFFER) > MAX_LOG_LINES:
+        LOG_BUFFER.pop(0)
+
+
 def largest_group_size(dets, eps):
-    """Size of the biggest cluster of detections whose centres chain within eps pixels.
-    Display only: this never influences which target is locked."""
     n = len(dets)
     if n < 2:
         return n
@@ -97,17 +106,17 @@ class KalmanCV:
 class StreamTracker:
     def __init__(self, group_eps):
         self.eps = group_eps
-        self.manual = False          # operator forced the lock
+        self.manual = False
         self.dets, self.ranked, self.group = [], [], 0
         self.history, self.spawn = {}, {}
         self.kf = KalmanCV(cfg["kalman_accel_var"], cfg["kalman_meas_sigma"])
         self.locked, self.locked_id = False, None
+        self.locked_conf, self.locked_age = 0.0, 0
         self.missing, self.challenge = 0, 0
         self.last_wh = (0.0, 0.0)
         self.status = "SEARCHING"
         self.box, self.center = None, None
 
-    # ---- filtering (size, aspect ratio, static-clutter gate) ----
     def filter_detections(self, boxes):
         dets, seen = [], set()
         if boxes is not None and len(boxes) > 0:
@@ -117,16 +126,11 @@ class StreamTracker:
             for i in range(len(xyxy)):
                 x1, y1, x2, y2 = (float(v) for v in xyxy[i][:4])
                 w, h = x2 - x1, y2 - y1
-                
-                # --- DEBUG LOGGING ---
                 if w < cfg["min_box_width"] or h < cfg["min_box_height"]:
-                    print(f"[DROP] Box too small: {w:.1f}x{h:.1f} (min {cfg['min_box_width']})")
                     continue
                 ar = w / (h + 1e-5)
                 if ar < cfg["min_aspect_ratio"] or ar > cfg["max_aspect_ratio"]:
-                    print(f"[DROP] Aspect ratio out of bounds: {ar:.2f}")
                     continue
-                
                 tid = int(ids[i]) if ids is not None else -(i + 1)
                 cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
                 seen.add(tid)
@@ -135,14 +139,11 @@ class StreamTracker:
                 hist.append((cx, cy))
                 if len(hist) > 30:
                     hist.pop(0)
-                
                 if (cfg["static_gate_enabled"] and tid != self.locked_id
                         and len(hist) >= cfg["static_gate_frames"]):
                     sx, sy = self.spawn[tid]
                     if math.hypot(cx - sx, cy - sy) < cfg["static_gate_px"]:
-                        print(f"[DROP] Static clutter gate triggered for id {tid}")
                         continue
-                
                 dets.append(dict(tid=tid, cx=cx, cy=cy, w=w, h=h, conf=float(confs[i]),
                                  age=len(hist), box=(x1, y1, x2, y2)))
         for k in [k for k in self.history if k not in seen]:
@@ -150,7 +151,6 @@ class StreamTracker:
             self.spawn.pop(k, None)
         return dets
 
-    # ---- target priority: bigger, nearer the centre, more confident, older ----
     def score(self, d):
         w = cfg["priority_weights"]
         size = min(math.sqrt(d["w"] * d["h"]) / (cfg["priority_size_ref"] * DIAG), 1.0)
@@ -161,6 +161,8 @@ class StreamTracker:
     def _lock(self, d):
         self.kf.reset(d["cx"], d["cy"])
         self.locked, self.locked_id = True, d["tid"]
+        self.locked_conf = d["conf"]
+        self.locked_age = d["age"]
         self.last_wh = (d["w"], d["h"])
         self.missing, self.challenge = 0, 0
         self.status = self._locked_status()
@@ -176,6 +178,7 @@ class StreamTracker:
 
     def _release(self):
         self.locked, self.locked_id = False, None
+        self.locked_conf, self.locked_age = 0.0, 0
         self.manual = False
         self.missing, self.challenge = 0, 0
         self.status = "SEARCHING"
@@ -185,13 +188,15 @@ class StreamTracker:
             self.kf.predict()
             px, py = self.kf.x[0], self.kf.x[1]
             match = next((d for d in dets if d["tid"] == self.locked_id), None)
-            if match is None and dets:  # ByteTrack may have re-issued the ID
+            if match is None and dets:
                 near = min(dets, key=lambda d: math.hypot(d["cx"] - px, d["cy"] - py))
                 if math.hypot(near["cx"] - px, near["cy"] - py) <= cfg["gate_px"]:
                     match = near
             if match is not None:
                 self.kf.update(match["cx"], match["cy"])
                 self.locked_id = match["tid"]
+                self.locked_conf = match["conf"]
+                self.locked_age = match["age"]
                 self.last_wh = (match["w"], match["h"])
                 self.missing, self.status = 0, self._locked_status()
                 others = [d for d in dets if d is not match]
@@ -205,7 +210,7 @@ class StreamTracker:
                     self._lock(best)
             else:
                 self.missing += 1
-                self.kf.x[2:] *= 0.9  # damp velocity so a long coast does not run away
+                self.kf.x[2:] *= 0.9
                 if self.missing > cfg["max_coast_frames"]:
                     self._release()
                 else:
@@ -230,9 +235,7 @@ class StreamTracker:
 
 
 # --------------------------------------------------------------------------
-# ESP32 serial link (aim only). Launcher stays under ESP32 firmware + hardware arm switch.
-# Packet: 0xA5 | cmd(1) seq(2) pan_mrad(2) tilt_mrad(2) flags(1) | xor checksum
-# flags bit0 = track valid. ESP32 should zero motion if no packet for ~150 ms.
+# ESP32 serial link with Fire Command support
 # --------------------------------------------------------------------------
 class Esp32Link:
     def __init__(self, c):
@@ -241,11 +244,13 @@ class Esp32Link:
             import serial
             self.ser = serial.Serial(c["port"], c["baud"], timeout=0)
 
-    def send(self, pan_rad, tilt_rad, valid):
+    def send(self, pan_rad, tilt_rad, valid, fire=False):
         if self.ser is None:
             return
+        # Bit 0 = track valid, Bit 1 = fire trigger
+        flags = (1 if valid else 0) | (2 if fire else 0)
         body = struct.pack("<BHhhB", 0x01, self.seq & 0xFFFF,
-                           int(pan_rad * 1000), int(tilt_rad * 1000), 1 if valid else 0)
+                           int(pan_rad * 1000), int(tilt_rad * 1000), flags)
         crc = 0
         for b in body:
             crc ^= b
@@ -257,10 +262,17 @@ class Esp32Link:
             self.ser.close()
 
 
-def px_to_angles(cx, cy):
+def px_to_angles(cx, cy, sensor_type="rgb"):
+    offsets = cfg.get("camera_offsets", {"rgb": {"x": 0, "y": 0}, "ir": {"x": 0, "y": 0}})
+    offset_x = offsets.get(sensor_type, {}).get("x", 0)
+    offset_y = offsets.get(sensor_type, {}).get("y", 0)
+    
+    adjusted_cx = cx + offset_x
+    adjusted_cy = cy + offset_y
+    
     fx = (W / 2) / math.tan(math.radians(cfg["camera_hfov_deg"]) / 2)
-    pan = math.atan((cx - W / 2) / fx)
-    tilt = math.atan((cy - H / 2) / fx)
+    pan = math.atan((adjusted_cx - W / 2) / fx)
+    tilt = math.atan((adjusted_cy - H / 2) / fx)
     return pan, (-tilt if cfg["invert_tilt"] else tilt)
 
 
@@ -286,6 +298,7 @@ def infer(model, frame, conf):
                        imgsz=cfg["inference_imgsz"], verbose=False,
                        device=device)[0].boxes
 
+
 def render(frame, tr, title):
     cv2.line(frame, (W // 2 - 12, H // 2), (W // 2 + 12, H // 2), (90, 90, 90), 1)
     cv2.line(frame, (W // 2, H // 2 - 12), (W // 2, H // 2 + 12), (90, 90, 90), 1)
@@ -293,7 +306,7 @@ def render(frame, tr, title):
     for rank, (_, d) in enumerate(tr.ranked, 1):
         rank_of[d["tid"]] = rank
         if tr.locked and d["tid"] == tr.locked_id:
-            continue  # drawn below as the locked target
+            continue
         x1, y1, x2, y2 = map(int, d["box"])
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 1)
         cv2.putText(frame, f"T{rank}", (x1, max(y1 - 5, 15)),
@@ -329,37 +342,117 @@ def panel(ir_tr, rgb_tr):
     return img
 
 
-def compose(disp_ir, disp_rgb, now, ir_tr, rgb_tr):
+def draw_button(banner, text, x1, y1, x2, y2, active=False, danger=False):
+    if danger:
+        bg_color = (0, 0, 180) if not active else (0, 0, 255)
+        border_color = (0, 0, 255)
+        text_color = (255, 255, 255)
+    else:
+        bg_color = (60, 60, 60) if not active else (0, 100, 150)
+        border_color = (0, 200, 255) if not active else (0, 255, 255)
+        text_color = (255, 255, 255) if not active else (0, 255, 255)
+    
+    cv2.rectangle(banner, (x1, y1), (x2, y2), bg_color, -1)
+    cv2.rectangle(banner, (x1, y1), (x2, y2), border_color, 1)
+    cv2.putText(banner, text, (x1 + 6, y1 + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.38, text_color, 1)
+
+
+def compose(disp_ir, disp_rgb, now, ir_tr, rgb_tr, state):
     feeds = np.hstack((disp_ir, disp_rgb))
     cv2.line(feeds, (W, 0), (W, H), (50, 50, 50), 3)
     banner = np.full((BANNER_H, W * 2, 3), 25, np.uint8)
-    cv2.putText(banner, "AEGIS C-UAS COMMAND & CONTROL SYSTEM", (20, 28),
+    
+    cv2.putText(banner, "C-UAV COMMAND & CONTROL SYSTEM", (20, 28),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
     n = max(ir_tr.group, rgb_tr.group)
     if n >= cfg["swarm_alert_size"]:
-        cv2.putText(banner, f"SWARM ALERT x{n}", (450, 28),
+        cv2.putText(banner, f"SWARM ALERT x{n}", (430, 28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
-    cv2.putText(banner, f"SYS TIME: {ts} | MODE: ACTIVE TRACKING", (W + 40, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
-    return np.vstack((banner, feeds, panel(ir_tr, rgb_tr)))
+
+    # GUI Interactive Buttons (Width = 1280)
+    draw_button(banner, f"AIM: {state['aim_sensor'].upper()}", 600, 8, 715, 36, active=True)
+    draw_button(banner, f"AUTO: {'ON' if state['auto_shoot'] else 'OFF'}", 725, 8, 850, 36, active=state['auto_shoot'])
+    draw_button(banner, "RELEASE", 860, 8, 960, 36, active=False)
+    draw_button(banner, f"LOGS: {'ON' if state['show_logs'] else 'OFF'}", 970, 8, 1080, 36, active=state['show_logs'])
+    draw_button(banner, "FIRE!", 1090, 8, 1260, 36, active=False, danger=True)
+
+    components = [banner, feeds, panel(ir_tr, rgb_tr)]
+
+    if state["show_logs"]:
+        term_h = 130
+        term_img = np.full((term_h, W * 2, 3), 12, np.uint8)
+        cv2.rectangle(term_img, (0, 0), (W * 2, term_h), (30, 30, 30), 1)
+        cv2.putText(term_img, ">> LIVE SYSTEM TERMINAL LOGS", (15, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 100), 1)
+        cv2.line(term_img, (10, 28), (W * 2 - 10, 28), (50, 50, 50), 1)
+        
+        for idx, log_line in enumerate(LOG_BUFFER[-5:]):
+            cv2.putText(term_img, log_line, (15, 48 + idx * 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        components.append(term_img)
+
+    return np.vstack(components)
 
 
-def select_at(x, y, ir_tr, rgb_tr):
-    """Click in the combined window -> force-lock the target box under the cursor."""
+def handle_click(x, y, ir_tr, rgb_tr, state):
+    """Handle mouse clicks on banner buttons or target bounding boxes."""
+    if 0 <= y < BANNER_H:
+        if 600 <= x <= 715:
+            state["aim_sensor"] = "ir" if state["aim_sensor"] == "rgb" else "rgb"
+            log_message(f"[UI] Aim Sensor switched to: {state['aim_sensor'].upper()}")
+            return True
+        elif 725 <= x <= 850:
+            state["auto_shoot"] = not state["auto_shoot"]
+            log_message(f"[UI] Auto-Shoot toggled to: {'ON' if state['auto_shoot'] else 'OFF'}")
+            return True
+        elif 860 <= x <= 960:
+            ir_tr._release()
+            rgb_tr._release()
+            log_message("[UI] All target locks released.")
+            return True
+        elif 970 <= x <= 1080:
+            state["show_logs"] = not state["show_logs"]
+            log_message(f"[UI] Terminal logs toggled to: {'ON' if state['show_logs'] else 'OFF'}")
+            return True
+        elif 1090 <= x <= 1260:
+            state["manual_fire_trigger"] = True
+            log_message("[UI] MANUAL FIRE TRIGGERED VIA BUTTON!")
+            return True
+        return False
+
     y -= BANNER_H
+    panel_height = 28 + cfg["panel_rows"] * 18 + 8
+    total_content_h = H + panel_height
+    if state["show_logs"]:
+        total_content_h += 130
+    if y >= total_content_h:
+        return False
+
     if not (0 <= y < H) or not (0 <= x < 2 * W):
-        return
-    tr, x = (ir_tr, x) if x < W else (rgb_tr, x - W)
+        return False
+    
+    tr, adjusted_x = (ir_tr, x) if x < W else (rgb_tr, x - W)
     hits = [d for _, d in tr.ranked
-            if d["box"][0] - 6 <= x <= d["box"][2] + 6 and d["box"][1] - 6 <= y <= d["box"][3] + 6]
+            if d["box"][0] - 6 <= adjusted_x <= d["box"][2] + 6 and d["box"][1] - 6 <= y <= d["box"][3] + 6]
     if hits:
         tr.manual_lock(min(hits, key=lambda d: d["w"] * d["h"]))
+        log_message(f"[UI] Force-locked target ID {tr.locked_id} via mouse click.")
+        return True
+    return False
 
 
 # --------------------------------------------------------------------------
 def main():
-    print("Starting Aegis C-UAS v2...")
+    log_message("Starting C-UAV v2 with Interception & Auto-Shoot...")
+    
+    state = {
+        "aim_sensor": cfg.get("aim_sensor", "rgb").lower(),
+        "show_logs": True,
+        "auto_shoot": cfg.get("auto_shoot_enabled", False),
+        "manual_fire_trigger": False
+    }
+
     ir_model, rgb_model = YOLO(cfg["thermal_model_path"]), YOLO(cfg["rgb_model_path"])
     cap_ir, cap_rgb = open_source(cfg["ir_source"]), open_source(cfg["rgb_source"])
     iv_ir = 1.0 / (cap_ir.get(cv2.CAP_PROP_FPS) or 30)
@@ -368,16 +461,20 @@ def main():
     rgb_tr = StreamTracker(cfg["group_eps"]["rgb"])
     link = Esp32Link(cfg["esp32"])
     show = cfg["show_window"]
-    win = "Aegis C-UAS Command & Control Interface"
+    win = "C-UAV Command & Control Interface"
+    
     if show:
         cv2.namedWindow(win)
         cv2.setMouseCallback(
-            win, lambda ev, x, y, fl, p: ev == cv2.EVENT_LBUTTONDOWN and select_at(x, y, ir_tr, rgb_tr))
+            win, lambda ev, x, y, fl, p: ev == cv2.EVENT_LBUTTONDOWN and handle_click(x, y, ir_tr, rgb_tr, state))
+    
     disp_ir = np.zeros((H, W, 3), np.uint8)
     disp_rgb = disp_ir.copy()
     next_ir = next_rgb = time.time()
     ms = {"IR": 0.0, "RGB": 0.0}
     t_log = time.time()
+    last_fire_time = 0.0
+    fire_cooldown = cfg.get("fire_cooldown", 2.0)
 
     try:
         while True:
@@ -408,36 +505,83 @@ def main():
                 updated = True
 
             if updated:
-                order = (rgb_tr, ir_tr) if cfg["aim_sensor"] == "rgb" else (ir_tr, rgb_tr)
-                src = (next((t for t in order if t.locked and t.manual), None)
-                       or next((t for t in order if t.locked), None))
+                active_tr = rgb_tr if state["aim_sensor"] == "rgb" else ir_tr
+                other_tr = ir_tr if state["aim_sensor"] == "rgb" else rgb_tr
+
+                src = None
+                if active_tr.locked and active_tr.manual:
+                    src = active_tr
+                elif other_tr.locked and other_tr.manual:
+                    src = other_tr
+                elif active_tr.locked:
+                    src = active_tr
+                elif other_tr.locked:
+                    src = other_tr
+
+                should_fire = False
+
+                # 1. Check Manual Fire Trigger (from button or hotkey 'f')
+                if state["manual_fire_trigger"]:
+                    if src and (now - last_fire_time >= fire_cooldown):
+                        should_fire = True
+                        log_message("[ACTION] Manual Interception Fired!")
+                        last_fire_time = now
+                    else:
+                        log_message("[WARNING] Cannot fire: No active target lock or cooldown active.")
+                    state["manual_fire_trigger"] = False
+
+                # 2. Check Auto-Shoot Criteria
+                elif state["auto_shoot"] and src and src.locked:
+                    conf_ok = src.locked_conf >= cfg.get("auto_shoot_confidence", 0.65)
+                    age_ok = src.locked_age >= cfg.get("auto_shoot_min_age", 15)
+                    cooldown_ok = (now - last_fire_time >= fire_cooldown)
+
+                    if conf_ok and age_ok and cooldown_ok:
+                        should_fire = True
+                        log_message(f"[AUTO-SHOOT] Target locked (Conf: {src.locked_conf:.2f}, Age: {src.locked_age}f). Interception Fired!")
+                        last_fire_time = now
+
                 if src:
-                    pan, tilt = px_to_angles(*src.center)
-                    link.send(pan, tilt, True)
+                    sensor_name = "rgb" if src is rgb_tr else "ir"
+                    pan, tilt = px_to_angles(*src.center, sensor_type=sensor_name)
+                    link.send(pan, tilt, True, fire=should_fire)
                 else:
-                    link.send(0.0, 0.0, False)
+                    link.send(0.0, 0.0, False, fire=False)
+
                 if show:
-                    cv2.imshow(win, compose(disp_ir, disp_rgb, now, ir_tr, rgb_tr))
+                    cv2.imshow(win, compose(disp_ir, disp_rgb, now, ir_tr, rgb_tr, state))
 
             if show:
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
-                if key == ord("a"):      # back to automatic target selection
+                if key == ord("s"):  # Toggle aim sensor
+                    state["aim_sensor"] = "ir" if state["aim_sensor"] == "rgb" else "rgb"
+                    log_message(f"[MODE] Aim Sensor switched via key to: {state['aim_sensor'].upper()}")
+                if key == ord("l"):  # Toggle on-screen logs
+                    state["show_logs"] = not state["show_logs"]
+                    log_message(f"[MODE] Terminal logs toggled via key to: {'ON' if state['show_logs'] else 'OFF'}")
+                if key == ord("f"):  # Manual Fire hotkey
+                    state["manual_fire_trigger"] = True
+                    log_message("[KEY] Manual fire triggered via hotkey 'f'.")
+                if key == ord(" "):  # Spacebar toggles auto-shoot
+                    state["auto_shoot"] = not state["auto_shoot"]
+                    log_message(f"[MODE] Auto-shoot toggled via spacebar to: {'ON' if state['auto_shoot'] else 'OFF'}")
+                if key == ord("a"):  # Auto-select mode
                     ir_tr.manual = rgb_tr.manual = False
-                if key == ord("r"):      # release both locks
+                if key == ord("r"):  # Release locks
                     ir_tr._release()
                     rgb_tr._release()
             time.sleep(0.001)
 
             if now - t_log > 2.0:
-                print(f"inference ms  IR {ms['IR']:.0f} | RGB {ms['RGB']:.0f}   "
-                      f"IR {ir_tr.status} | RGB {rgb_tr.status}")
+                log_message(f"inference ms  IR {ms['IR']:.0f} | RGB {ms['RGB']:.0f}   "
+                            f"IR {ir_tr.status} | RGB {rgb_tr.status} | AIM: {state['aim_sensor'].upper()} | AUTO: {state['auto_shoot']}")
                 t_log = now
     except KeyboardInterrupt:
         pass
     finally:
-        link.send(0.0, 0.0, False)
+        link.send(0.0, 0.0, False, fire=False)
         link.close()
         cap_ir.release()
         cap_rgb.release()
