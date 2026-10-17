@@ -1,4 +1,0 @@
-# Only needed on the machine where you convert .pt -> .onnx (python export_models.py)
--r requirements.txt
-onnx>=1.16
-onnxslim>=0.1.34
