@@ -1,14 +1,14 @@
 {
   "device": "cpu",
-  "thermal_model_path": "models/thermal_best.pt",
-  "rgb_model_path": "models/rgb_best.pt",
+  "thermal_model_path": "models/thermal_best.onnx",
+  "rgb_model_path": "models/rgb_best.onnx",
   "ir_source": "IR_videos/ir_test.mp4",
-  "rgb_source": "RGB_videos/visible.mp4",
+  "rgb_source": "RGB_videos/test4.mp4",
   "loop_videos": false,
   "show_window": true,
-  "frame_width": 640,
-  "frame_height": 480,
-  "inference_imgsz": 640,
+  "frame_width": 720,
+  "frame_height": 720,
+  "inference_imgsz": 480,
   "thermal_confidence": 0.4,
   "rgb_confidence": 0.4,
   "min_box_width": 12,
@@ -32,6 +32,12 @@
     "conf": 0.25,
     "age": 0.15
   },
+  "group_eps": {
+    "ir": 55,
+    "rgb": 250
+  },
+  "swarm_alert_size": 3,
+  "panel_rows": 5,
   "aim_sensor": "rgb",
   "camera_hfov_deg": 60,
   "invert_tilt": false,
@@ -45,19 +51,17 @@
       "y": 0
     }
   },
+  "require_arm": true,
   "auto_shoot_enabled": false,
   "auto_shoot_confidence": 0.65,
   "auto_shoot_min_age": 15,
+  "auto_shoot_max_error_deg": 2.0,
   "fire_cooldown": 2.0,
   "esp32": {
     "enabled": false,
     "port": "/dev/ttyUSB0",
     "baud": 921600
   },
-  "group_eps": {
-    "ir": 55,
-    "rgb": 250
-  },
-  "swarm_alert_size": 3,
-  "panel_rows": 5
+  "timing_csv": "timing_log.csv",
+  "window_scale": 1.0
 }
