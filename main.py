@@ -754,37 +754,9 @@ class OpenCVSource:
         self.cap.release()
 
 
-class PiCamera2Source:
-    """Raspberry Pi CSI camera (including NoIR modules) through picamera2.
-    NOTE: written from the picamera2 documentation and NOT tested on hardware.
-    Needs `sudo apt install python3-picamera2` (not available from pip on most setups)."""
 
-    def __init__(self, key, sc):
-        from picamera2 import Picamera2
-        cam = sc.get("camera", {})
-        self.w, self.h = sc["width"], sc["height"]
-        self.crop = sc.get("crop")
-        self.cam = Picamera2(int(sc.get("source", 0)))
-        size = (cam.get("width", self.w), cam.get("height", self.h))
-        config = self.cam.create_video_configuration(
-            main={"size": size, "format": "RGB888"},          # RGB888 is BGR byte order = OpenCV order
-            controls={"FrameRate": cam.get("fps", 30)},
-            buffer_count=2, queue=False)                      # queue=False: always the most recent frame
-        self.cam.configure(config)
-        self.cam.start()
-        log_message(f"[CAM] {key.upper()}: picamera2 {size[0]}x{size[1]} @ {cam.get('fps', 30)} fps "
-                    f"-> processed at {self.w}x{self.h}")
+SOURCE_TYPES = {"opencv": OpenCVSource}
 
-    def read(self):
-        fr = self.cam.capture_array()
-        return to_proc(fr, self.w, self.h, self.crop), time.time()
-
-    def release(self):
-        self.cam.stop()
-        self.cam.close()
-
-
-SOURCE_TYPES = {"opencv": OpenCVSource, "picamera2": PiCamera2Source}
 
 
 def make_source(key):

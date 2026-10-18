@@ -33,7 +33,7 @@
     "rgb": {
       "title": "SENSOR 02: OPTICAL RGB",
       "type": "opencv",
-      "source": "RGB_videos/test4.mp4",
+      "source": "RGB_videos/test1.mp4",
       "camera": {
         "fourcc": "MJPG",
         "width": 1920,
@@ -102,7 +102,7 @@
     "status_wait_s": 2.0,
     "status_timeout_s": 1.0
   },
-  "auto_reload_enabled": false,
+  "auto_reload_enabled": true,
   "auto_reload_delay_s": 0.5,
   "reload_min_interval_s": 1.0,
   "reload_timeout_s": 3.0,
