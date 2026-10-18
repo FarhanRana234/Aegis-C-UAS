@@ -33,7 +33,7 @@
     "rgb": {
       "title": "SENSOR 02: OPTICAL RGB",
       "type": "opencv",
-      "source": "RGB_videos/test3.mp4",
+      "source": "RGB_videos/test4.mp4",
       "camera": {
         "fourcc": "MJPG",
         "width": 1920,
