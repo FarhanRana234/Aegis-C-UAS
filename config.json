@@ -21,8 +21,9 @@
       "height": 480,
       "hfov_deg": 60,
       "offset": {
-        "x": 0,
-        "y": 0
+        "x_inches": 0.0,
+        "y_inches": 0.0,
+        "known_target_width_inches": 12.0
       },
       "model_path": "models/thermal_best.onnx",
       "imgsz": 480,
@@ -45,11 +46,13 @@
       "height": 1080,
       "hfov_deg": 60,
       "offset": {
-        "x": 0,
-        "y": 0
+        "x_inches": 0.0,
+        "y_inches": 0.0,
+        "known_target_width_inches": 12.0
       },
       "model_path": "models/rgb_best.onnx",
-      "imgsz": [640,
+      "imgsz": [
+        640,
         480
       ],
       "confidence": 0.4,
