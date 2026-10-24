@@ -392,7 +392,24 @@ def px_to_angles(cx, cy, key):
     sc = SENS[key]
     w, h = sc["width"], sc["height"]
     off = sc.get("offset", {})
-    dx, dy = cx + off.get("x", 0) - w / 2, cy + off.get("y", 0) - h / 2
+    # 1. Get the inches values from config (defaulting to 0 if not present)
+    x_inch = off.get("x_inches", 0.0)
+    y_inch = off.get("y_inches", 0.0)
+    dist_inch = off.get("target_distance_inches", 120.0)
+
+    # 2. Calculate total real-world width and height visible at this distance
+    half_fov_rad = math.radians(sc["hfov_deg"]) / 2
+    span = h if sc.get("fov_across", "width") == "height" else w
+    visible_width_inches = 2.0 * dist_inch * math.tan(half_fov_rad)
+    visible_height_inches = visible_width_inches * (h / w)
+
+    # 3. Convert physical inches to resolution pixels dynamically
+    pixel_offset_x = (x_inch / visible_width_inches) * w
+    pixel_offset_y = (y_inch / visible_height_inches) * h
+
+    # 4. Apply the converted pixel offset to the tracking center line
+    dx = cx + pixel_offset_x - w / 2
+    dy = cy + pixel_offset_y - h / 2
     half = math.radians(sc["hfov_deg"]) / 2
     span = h if sc.get("fov_across", "width") == "height" else w   # axis that hfov_deg spans
     if sc.get("lens", "rectilinear") == "fisheye":
